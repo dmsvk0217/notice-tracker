@@ -1,22 +1,21 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
 import * as puppeteer from 'puppeteer';
 import * as twilio from 'twilio';
 import { Repository } from 'typeorm';
+import { getNoticeUrls, getTwilioConfig, noticeTypes } from './const';
 import { Notice } from './notice.entity';
 import { SELECTORS } from './selector';
 
 @Injectable()
 export class NoticeService {
   private readonly loginUrl: string;
-  private readonly boardUrl: string;
   private readonly userId: string;
   private readonly userPassword: string;
-  private readonly twilioSid: string;
-  private readonly twilioAuthToken: string;
-  private readonly twilioPhone: string;
-  private readonly receiverPhone: string;
+  private readonly NOTICE_URLS: Record<string, string>;
+  private readonly TWILIO_CONFIG: Record<string, string>;
 
   private browser: puppeteer.Browser;
   private page: puppeteer.Page;
@@ -25,39 +24,39 @@ export class NoticeService {
     private readonly configService: ConfigService,
 
     @InjectRepository(Notice)
-    private readonly noticeRepo: Repository<Notice>,
+    private readonly noticeRepository: Repository<Notice>,
   ) {
     this.loginUrl = this.configService.get<string>('LOGIN_URL');
-    this.boardUrl = this.configService.get<string>('BOARD_URL');
     this.userId = this.configService.get<string>('USER_ID');
     this.userPassword = this.configService.get<string>('USER_PASSWORD');
-    this.twilioSid = this.configService.get<string>('TWILIO_SID');
-    this.twilioAuthToken = this.configService.get<string>('TWILIO_AUTH_TOKEN');
-    this.twilioPhone = this.configService.get<string>('TWILIO_PHONE');
-    this.receiverPhone = this.configService.get<string>('RECEIVER_PHONE');
+
+    this.NOTICE_URLS = getNoticeUrls(configService);
+    this.TWILIO_CONFIG = getTwilioConfig(configService);
   }
 
-  // @Cron(CronExpression.EVERY_MINUTE)
+  @Cron(CronExpression.EVERY_30_MINUTES)
   async checkNotices() {
-    console.log('🔍 공지 확인 중...');
-
     await this.initBrowser();
     await this.login();
-    const notices = await this.scrapeNotices();
 
-    const newNotices = [];
-    for (const notice of notices) {
-      newNotices.push(notice);
-    }
-    console.log('🚀 ~ NoticeService ~ checkNotices ~ newNotices:', newNotices);
+    for (const type of noticeTypes) {
+      console.log('🚀 type:', type);
+      const notices = await this.scrapeNotices(this.NOTICE_URLS[type]);
+      if (notices.length === 0) return;
 
-    if (newNotices.length > 0) {
-      console.log(`🚀 새로운 공지 발견: ${newNotices.length}개`);
-      for (const notice of newNotices) {
-        // await this.sendSMS(notice.title);
+      const newNoticesToSend = await this.getNewNotices(type, notices);
+
+      if (newNoticesToSend.length > 0) {
+        console.log('🚀 newNoticesToSend:', newNoticesToSend);
+        for (const notice of newNoticesToSend) {
+          await this.sendSMS(type, notice.title);
+        }
+
+        await this.updateLatestNoticeId(type, newNoticesToSend);
+      } else {
+        console.log('📢 새로운 공지가 없습니다.');
       }
-    } else {
-      console.log('📢 새로운 공지가 없습니다.');
+      console.log('\n');
     }
 
     await this.closeBrowser();
@@ -81,9 +80,9 @@ export class NoticeService {
     console.log('✅ 로그인 성공, 세션 유지');
   }
 
-  private async scrapeNotices() {
+  private async scrapeNotices(url: string) {
     console.log('📄 공지 크롤링 중...');
-    await this.page.goto(this.boardUrl, { waitUntil: 'networkidle2' });
+    await this.page.goto(url, { waitUntil: 'networkidle2' });
 
     const notices = await this.page.evaluate((selectors) => {
       const noticeList = [];
@@ -107,25 +106,59 @@ export class NoticeService {
     return notices;
   }
 
-  private async sendSMS(message: string) {
-    const client = twilio(this.twilioSid, this.twilioAuthToken);
-
-    await client.messages.create({
-      body: `📢 새 공지: ${message}`,
-      from: this.twilioPhone,
-      to: this.receiverPhone,
-    });
-
-    console.log(`📩 문자 발송 완료: ${message}`);
-  }
-
-  /**
-   * Puppeteer 브라우저 종료
-   */
   private async closeBrowser() {
     if (this.browser) {
       await this.browser.close();
       console.log('🛑 Puppeteer 브라우저 종료');
     }
+  }
+
+  async getLatestNoticeId(type: string): Promise<number> {
+    const latestNotice = await this.noticeRepository.findOne({
+      where: { type: type },
+      order: { id: 'DESC' },
+    });
+
+    return latestNotice ? Number(latestNotice.id) : 0;
+  }
+
+  async getNewNotices(
+    type: string,
+    notices: { id: string; title: string }[],
+  ): Promise<{ id: string; title: string }[]> {
+    const latestNoticeId = await this.getLatestNoticeId(type);
+    console.log(`🔎 가장 최근 인식된 ${type} 공지 ID: ${latestNoticeId}`);
+
+    return latestNoticeId
+      ? notices.filter((notice) => Number(notice.id) > latestNoticeId)
+      : [];
+  }
+
+  async updateLatestNoticeId(
+    type: string,
+    newNotices: { id: string }[],
+  ): Promise<void> {
+    if (newNotices.length === 0) return;
+
+    const maxId = Math.max(...newNotices.map((notice) => Number(notice.id)));
+
+    await this.noticeRepository.update({ type }, { id: maxId.toString() });
+
+    console.log(`🔄 ${type} 공지 최신 ID 업데이트: ${maxId}`);
+  }
+
+  private async sendSMS(type: string, message: string) {
+    const client = twilio(
+      this.TWILIO_CONFIG.twilioSid,
+      this.TWILIO_CONFIG.twilioAuthToken,
+    );
+
+    await client.messages.create({
+      body: `[${type}] ${message}`,
+      from: this.TWILIO_CONFIG.twilioPhone,
+      to: this.TWILIO_CONFIG.receiverPhone,
+    });
+
+    console.log(`📩 문자 발송 완료: ${message}`);
   }
 }
