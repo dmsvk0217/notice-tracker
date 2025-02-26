@@ -63,6 +63,11 @@ export class NoticeService {
   }
 
   private async initBrowser() {
+    const browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+
     this.browser = await puppeteer.launch({ headless: true });
     this.page = await this.browser.newPage();
   }
