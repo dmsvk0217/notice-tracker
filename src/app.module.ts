@@ -6,14 +6,14 @@ import { NoticeModule } from './notice/notice.module';
 
 @Module({
   imports: [
+    NoticeModule,
     ConfigModule.forRoot(),
     TypeOrmModule.forRoot({
       type: 'sqlite',
-      database: 'notices.db',
+      database: 'database.sqlite',
       entities: [Notice],
       synchronize: true,
     }),
-    NoticeModule,
   ],
 })
 export class AppModule {}
